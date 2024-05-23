@@ -1,36 +1,43 @@
-from flask import Flask, request, render_template_string
+from flask import Flask, redirect, url_for, session, request, jsonify, render_template_string
+from authlib.integrations.flask_client import OAuth
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime
 
 app = Flask(__name__)
+app.secret_key = '4c3d2e1f0a9b8c7d6e5f4g3h2i1j0k9l'  # Replace with your own secret key
+
+# OIDC configuration
+client_id = "306a6d10-0a7f-47b6-bae3-75a0c851526e"
+client_secret = "5ccf1d06-13d5-4d82-a0af-ca729686130a"
+discovery_url = "https://idp.mycityapp.cloud.test.kobil.com/auth/realms/worms/.well-known/openid-configuration"
+
+oauth = OAuth(app)
+oidc_client = oauth.register(
+    name='oidc',
+    client_id=client_id,
+    client_secret=client_secret,
+    server_metadata_url=discovery_url,
+    client_kwargs={
+        'scope': 'openid profile email',
+    }
+)
 
 def get_street_web_address(street_name):
-    print(f"Suche nach Straße: {street_name}")
     url = f"https://www.ebwo.de/de/abfallkalender/2024/?sTerm={street_name}"
-    print(f"Such-URL: {url}")
-    
     response = requests.get(url)
     response.raise_for_status()
     soup = BeautifulSoup(response.text, 'html.parser')
 
-    # Find the <li> element with the street link
     list_entries = soup.find_all('li', class_='listEntryObject-news')
-    print(f"{len(list_entries)} Listeneinträge gefunden")
-
     for entry in list_entries:
         if street_name.lower() in entry.get_text(strip=True).lower():
             street_url = entry.get('data-url')
             if street_url:
-                full_street_url = f"https://www.ebwo.de{street_url}"
-                print(f"Straßen-URL gefunden: {full_street_url}")
-                return full_street_url
-    
-    print(f"Kein Link für Straße gefunden: {street_name}")
+                return f"https://www.ebwo.de{street_url}"
     return None
 
 def get_abholtermine(street_url):
-    print(f"Abholtermine abrufen von: {street_url}")
     response = requests.get(street_url)
     response.raise_for_status()
     soup = BeautifulSoup(response.text, 'html.parser')
@@ -41,42 +48,47 @@ def get_abholtermine(street_url):
         "Bio-Abfälle": []
     }
 
-    # Extract dates from all relevant divs
     divs = soup.find_all('div', style=lambda value: value and 'margin-top:25px;' in value)
-    current_category = None
     category_order = ["Gelbe Tonne", "Altpapier", "Restabfall (bis 240 Liter)", "Bio-Abfälle"]
 
     for idx, div in enumerate(divs):
-        # Assign category based on the current index in the order
         current_category = category_order[idx % len(category_order)]
         div_content = div.get_text(separator="\n").split("\n")
         dates = [d.strip() for d in div_content if d.strip() and d.strip().isdigit() == False and d.strip().count('.') == 2]
         
         abholtermine[current_category].extend(dates)
 
-    # Sort dates within each category
     for category in abholtermine:
         abholtermine[category] = sorted(abholtermine[category], key=lambda date: datetime.strptime(date, "%d.%m.%Y"))
 
-    print(f"Abholtermine gefunden: {abholtermine}")
     return abholtermine
 
-@app.route('/', methods=['GET', 'POST'])
-def index():
-    if request.method == 'POST':
-        street_name = request.form['street_name']
-        print(f"Formular mit Straßenname eingereicht: {street_name}")
-        street_url = get_street_web_address(street_name)
-        if street_url:
-            abholtermine = get_abholtermine(street_url)
-            return render_template_string(TEMPLATE, street_name=street_name, abholtermine=abholtermine)
-        else:
-            error = "Straße nicht gefunden. Bitte versuchen Sie es erneut."
-            print(error)
-            return render_template_string(TEMPLATE, error=error)
-    return render_template_string(TEMPLATE)
+@app.route('/test')
+def test():
+    return "Test route is working"
 
-TEMPLATE = '''
+@app.route('/oidc')
+def oidc():
+    redirect_uri = url_for('oidc_callback', _external=True)
+    return oidc_client.authorize_redirect(redirect_uri)
+
+@app.route('/oidc/callback')
+def oidc_callback():
+    token = oidc_client.authorize_access_token()
+    user_info = oidc_client.parse_id_token(token)
+    
+    street_name = user_info.get('address')
+    if not street_name:
+        return "Address not found in user attributes", 400
+
+    street_url = get_street_web_address(street_name)
+    if street_url:
+        abholtermine = get_abholtermine(street_url)
+        return render_template_string(OIDC_TEMPLATE, street_name=street_name, abholtermine=abholtermine)
+    else:
+        return "Street not found. Please try again.", 404
+
+OIDC_TEMPLATE = '''
 <!doctype html>
 <html lang="de">
   <head>
@@ -92,13 +104,6 @@ TEMPLATE = '''
           <h1>Abholtermine Finder</h1>
         </div>
         <div class="card-body">
-          <form method="post">
-            <div class="form-group">
-              <label for="street_name">Straßenname</label>
-              <input type="text" class="form-control" id="street_name" name="street_name" required>
-            </div>
-            <button type="submit" class="btn btn-primary">Abholtermine finden</button>
-          </form>
           {% if abholtermine %}
             <h2 class="mt-4">Abholtermine für {{ street_name }}</h2>
             {% for category, dates in abholtermine.items() %}
